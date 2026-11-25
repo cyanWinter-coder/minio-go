@@ -46,6 +46,13 @@ type parallelGetServer struct {
 
 	// shortAt truncates the body of the range GET starting at this offset.
 	shortAt int64
+	// failAt fails the range GET starting at this offset with a 500.
+	failAt int64
+	// delay, when positive, is slept before serving each range GET.
+	delay time.Duration
+	// checksumCRC32, when set, is advertised as the full-object CRC32
+	// checksum of the object.
+	checksumCRC32 string
 }
 
 func newParallelGetServer(t *testing.T, size int) *parallelGetServer {
@@ -54,7 +61,7 @@ func newParallelGetServer(t *testing.T, size int) *parallelGetServer {
 	if _, err := rand.Read(data); err != nil {
 		t.Fatal(err)
 	}
-	s := &parallelGetServer{data: data, shortAt: -1}
+	s := &parallelGetServer{data: data, shortAt: -1, failAt: -1}
 	s.Server = httptest.NewServer(http.HandlerFunc(s.handle))
 	t.Cleanup(s.Close)
 	return s
@@ -63,6 +70,10 @@ func newParallelGetServer(t *testing.T, size int) *parallelGetServer {
 func (s *parallelGetServer) handle(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("ETag", `"`+parallelTestETag+`"`)
 	w.Header().Set("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+	if s.checksumCRC32 != "" {
+		w.Header().Set("x-amz-checksum-type", "FULL_OBJECT")
+		w.Header().Set("x-amz-checksum-crc32", s.checksumCRC32)
+	}
 	if r.Method == http.MethodHead {
 		w.Header().Set("Content-Length", strconv.Itoa(len(s.data)))
 		return
@@ -94,6 +105,13 @@ func (s *parallelGetServer) handle(w http.ResponseWriter, r *http.Request) {
 	if _, err := fmt.Sscanf(rng, "bytes=%d-%d", &start, &end); err != nil || end >= int64(len(s.data)) {
 		http.Error(w, "bad range", http.StatusRequestedRangeNotSatisfiable)
 		return
+	}
+	if start == s.failAt {
+		http.Error(w, "injected range failure", http.StatusInternalServerError)
+		return
+	}
+	if s.delay > 0 {
+		time.Sleep(s.delay)
 	}
 	body := s.data[start : end+1]
 	if start == s.shortAt {

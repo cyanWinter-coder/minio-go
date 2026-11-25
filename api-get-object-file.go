@@ -68,6 +68,13 @@ func (c *Client) FGetObject(ctx context.Context, bucketName, objectName, filePat
 		return err
 	}
 
+	// Download with concurrent range GETs when enabled and the object is
+	// large enough to split into more than one range.
+	if opts.parallelGetEnabled() && objectStat.ETag != "" &&
+		objectStat.Size > parallelGetChunkSize(opts.ParallelChunkSize, objectStat.Size) {
+		return c.fGetObjectParallel(ctx, bucketName, objectName, filePath, opts, objectStat)
+	}
+
 	// Write to a temporary file "fileName.part.minio" before saving.
 	filePartPath := filepath.Join(filepath.Dir(filePath), sum256Hex([]byte(filepath.Base(filePath)+objectStat.ETag))+".part.minio")
 
