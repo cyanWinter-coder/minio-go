@@ -19,7 +19,10 @@ package credentials
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -163,12 +166,63 @@ func (e *Expiry) IsExpired() bool {
 // The first Credentials.Get() will always call Provider.Retrieve() to get the
 // first instance of the credentials Value. All calls to Get() after that
 // will return the cached credentials Value until IsExpired() returns true.
+//
+// When the provider enters its refresh lead window, concurrent callers share
+// one retrieval and its result. If that retrieval fails but the cached Value
+// has a non-zero Expiration still in the future, the cached Value continues to
+// be returned until its hard Expiration. Successful replacements are stored
+// under the Credentials lock and ordered by refresh generation so a delayed
+// older result cannot replace a newer one.
 type Credentials struct {
 	sync.Mutex
 
 	creds        Value
 	forceRefresh bool
 	provider     Provider
+
+	// inFlight is the single refresh shared by all concurrent callers. It is
+	// never used to hold the lock across a provider call.
+	inFlight *credentialRefresh
+	waiters  int
+
+	// refreshSequence orders refresh attempts, and appliedSequence records
+	// the attempt whose result currently occupies creds. If two attempts ever
+	// overlap, a late older result cannot replace a newer one.
+	refreshSequence uint64
+	appliedSequence uint64
+	haveCreds       bool
+
+	// lastRefreshErr retains the most recent provider/chain failure. A
+	// still-valid cached value may be returned to callers while this remains
+	// non-nil.
+	lastRefreshErr error
+
+	// CurrentTime optionally overrides the clock used for the cached Value's
+	// hard Expiration. It mirrors Expiry.CurrentTime and is primarily useful
+	// in boundary tests. Now is an equivalent shorter hook name.
+	CurrentTime func() time.Time
+	Now         func() time.Time
+
+	// test clock aliases keep white-box tests independent of the hook name.
+	now         func() time.Time
+	nowFunc     func() time.Time
+	timeNow     func() time.Time
+	currentTime func() time.Time
+}
+
+// credentialRefresh is the shared result of one provider retrieval.
+type credentialRefresh struct {
+	done chan struct{}
+
+	sequence uint64
+	err      error
+
+	// result and resultErr are finalized once, under Credentials.Lock, before
+	// done is closed. Every waiter therefore observes the same outcome.
+	result     Value
+	resultErr  error
+	panicValue any
+	goexit     bool
 }
 
 // New returns a pointer to a new Credentials with the provider set.
@@ -213,19 +267,206 @@ func (c *Credentials) GetWithContext(cc *CredContext) (Value, error) {
 		cc = defaultCredContext
 	}
 
+	for {
+		c.Lock()
+		if refresh := c.inFlight; refresh != nil {
+			c.Unlock()
+			return c.waitForRefresh(cc, refresh)
+		}
+
+		if !c.isExpired() {
+			creds := c.creds
+			c.Unlock()
+			return creds, nil
+		}
+
+		c.refreshSequence++
+		refresh := &credentialRefresh{
+			done:     make(chan struct{}),
+			sequence: c.refreshSequence,
+		}
+		c.inFlight = refresh
+		c.Unlock()
+
+		c.runRefresh(refresh, cc)
+		return c.waitForRefresh(cc, refresh)
+	}
+}
+
+// waitForRefresh waits for the shared result while honoring the caller's
+// context. A result that is already available wins over context cancellation.
+func (c *Credentials) waitForRefresh(cc *CredContext, refresh *credentialRefresh) (Value, error) {
+	c.Lock()
+	c.waiters++
+	c.Unlock()
+	defer func() {
+		c.Lock()
+		c.waiters--
+		c.Unlock()
+	}()
+
+	ctx := cc.requestContext()
+
+	select {
+	case <-refresh.done:
+	case <-ctx.Done():
+		// Prefer a result that completed concurrently with cancellation.
+		select {
+		case <-refresh.done:
+		default:
+			return Value{}, ctx.Err()
+		}
+	}
+
+	if refresh.panicValue != nil {
+		panic(refresh.panicValue)
+	}
+	if refresh.goexit {
+		// Match the provider/runtime semantics: a Goexit in the shared
+		// retrieval goroutine terminates each waiting caller's goroutine.
+		runtime.Goexit()
+	}
+
+	// If this caller's context was canceled but the provider failure was
+	// caused by that cancellation, report the caller's context error rather
+	// than serving stale credentials to a caller that has already gone away.
+	if err := ctx.Err(); err != nil && refresh.err != nil {
+		return Value{}, err
+	}
+	return refresh.result, refresh.resultErr
+}
+
+// runRefresh calls the provider exactly once for a refresh generation and
+// finalizes the shared result.
+func (c *Credentials) runRefresh(refresh *credentialRefresh, cc *CredContext) {
+	completed := false
+	defer func() {
+		if r := recover(); r != nil {
+			c.finishRefresh(refresh, Value{}, nil, r, false)
+			// Preserve the historical behavior of panicking on the retrieving
+			// goroutine's caller. Shared waiters re-panic the same value.
+			panic(r)
+		}
+		if !completed {
+			// runtime.Goexit runs defers without a recover value. Finalize the
+			// waiters, then continue unwinding this goroutine.
+			c.finishRefresh(refresh, Value{}, errCredentialRefreshGoexit, nil, true)
+			runtime.Goexit()
+		}
+	}()
+
+	value, err := c.provider.RetrieveWithCredContext(cc)
+	completed = true
+	c.finishRefresh(refresh, value, err, nil, false)
+}
+
+// errCredentialRefreshGoexit is delivered to direct waiters when the provider
+// exits their shared retrieval goroutine with runtime.Goexit.
+var errCredentialRefreshGoexit = errors.New("credential retrieval exited")
+
+func (c *Credentials) finishRefresh(refresh *credentialRefresh, value Value, err error, panicValue any, goexit bool) {
 	c.Lock()
 	defer c.Unlock()
 
-	if c.isExpired() {
-		creds, err := c.provider.RetrieveWithCredContext(cc)
+	if c.inFlight == refresh {
+		c.inFlight = nil
+	}
+	refresh.err = err
+	refresh.panicValue = panicValue
+	refresh.goexit = goexit
+	c.lastRefreshErr = err
+
+	switch {
+	case panicValue != nil || goexit:
+		refresh.result = Value{}
 		if err != nil {
-			return Value{}, err
+			refresh.resultErr = err
+		} else if panicValue != nil {
+			refresh.resultErr = fmt.Errorf("credential retrieval panic: %v", panicValue)
+		} else {
+			refresh.resultErr = errCredentialRefreshGoexit
 		}
-		c.creds = creds
-		c.forceRefresh = false
+
+	case err == nil:
+		// A newer attempt may already have committed if attempts overlapped.
+		// Never let this older result move the cache backwards.
+		if refresh.sequence >= c.appliedSequence {
+			c.creds = value
+			c.haveCreds = true
+			c.forceRefresh = false
+			c.appliedSequence = refresh.sequence
+		}
+		refresh.result = c.creds
+		refresh.resultErr = nil
+
+	default:
+		// Proactive refresh (or a call to Expire) can fail while the
+		// previously cached credentials are still inside their real lifetime.
+		// Keep serving them until their actual Expiration; the failed refresh
+		// remains available through LastRefreshError.
+		if c.hasCachedValueLocked() && !c.cachedValueTrulyExpiredLocked() {
+			refresh.result = c.creds
+			refresh.resultErr = nil
+		} else {
+			refresh.result = Value{}
+			refresh.resultErr = err
+		}
 	}
 
-	return c.creds, nil
+	close(refresh.done)
+}
+
+// LastRefreshError returns the most recent retrieval error, if any. A non-nil
+// value does not imply that GetWithContext is failing: a still-valid cached
+// credential may be served as a fallback.
+func (c *Credentials) LastRefreshError() error {
+	c.Lock()
+	defer c.Unlock()
+	return c.lastRefreshErr
+}
+
+func (c *Credentials) hasCachedValueLocked() bool {
+	if c.haveCreds {
+		return true
+	}
+	// Allow white-box callers and older test setups that assign c.creds
+	// directly to be recognized without setting the internal bool.
+	return c.creds != (Value{})
+}
+
+func (c *Credentials) nowTime() time.Time {
+	switch {
+	case c.CurrentTime != nil:
+		return c.CurrentTime()
+	case c.Now != nil:
+		return c.Now()
+	case c.currentTime != nil:
+		return c.currentTime()
+	case c.nowFunc != nil:
+		return c.nowFunc()
+	case c.now != nil:
+		return c.now()
+	case c.timeNow != nil:
+		return c.timeNow()
+	default:
+		return time.Now()
+	}
+}
+
+// cachedValueTrulyExpiredLocked reports expiration against Value.Expiration,
+// the hard lifetime. Provider.IsExpired may return true earlier to enter the
+// refresh lead window. The boundary follows Expiry.IsExpired: the exact
+// Expiration instant is still accepted and the credential is expired only
+// after that instant.
+func (c *Credentials) cachedValueTrulyExpiredLocked() bool {
+	if !c.hasCachedValueLocked() {
+		return true
+	}
+	expiration := c.creds.Expiration
+	if expiration.IsZero() {
+		return false
+	}
+	return expiration.Before(c.nowTime())
 }
 
 // Expire expires the credentials and forces them to be retrieved on the
