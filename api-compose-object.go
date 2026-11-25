@@ -575,7 +575,7 @@ func (c *Client) ComposeObject(ctx context.Context, dst CopyDestOptions, srcs ..
 		userMeta = meta
 	}
 
-	uploadID, err := c.newUploadID(ctx, dst.Bucket, dst.Object, PutObjectOptions{
+	upload, err := c.newMultipartUpload(ctx, dst.Bucket, dst.Object, PutObjectOptions{
 		ServerSideEncryption: dst.Encryption,
 		UserMetadata:         userMeta,
 		UserTags:             userTags,
@@ -586,6 +586,7 @@ func (c *Client) ComposeObject(ctx context.Context, dst CopyDestOptions, srcs ..
 	if err != nil {
 		return UploadInfo{}, err
 	}
+	uploadID := upload.uploadID
 
 	// 3. Perform copy part uploads
 	var parts []copyPart
@@ -609,12 +610,14 @@ func (c *Client) ComposeObject(ctx context.Context, dst CopyDestOptions, srcs ..
 
 	objParts, err := c.uploadPartsCopy(ctx, dst, uploadID, parts)
 	if err != nil {
-		c.abortFailedUpload(ctx, dst.Bucket, dst.Object, uploadID)
-		return UploadInfo{}, err
+		return UploadInfo{}, upload.abort(ctx, err)
+	}
+	for _, p := range objParts {
+		upload.recordPart(p.PartNumber)
 	}
 
 	// 4. Make final complete-multipart request.
-	uploadInfo, err := c.completeMultipartUpload(ctx, dst.Bucket, dst.Object, uploadID,
+	uploadInfo, err := upload.complete(ctx,
 		completeMultipartUpload{Parts: objParts}, PutObjectOptions{ServerSideEncryption: dst.Encryption})
 	if err != nil {
 		return UploadInfo{}, err

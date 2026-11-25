@@ -605,6 +605,9 @@ func TestPutObjectUnknownLengthTruncation(t *testing.T) {
 			io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?>`+
 				`<CompleteMultipartUploadResult><Bucket>bucket</Bucket><Key>object</Key>`+
 				`<ETag>&quot;3858f62230ac3c915f300c664312c11f-2&quot;</ETag></CompleteMultipartUploadResult>`)
+		case r.Method == http.MethodDelete && q.Get("uploadId") != "":
+			io.Copy(io.Discard, r.Body)
+			w.WriteHeader(http.StatusNoContent)
 		default:
 			io.Copy(io.Discard, r.Body)
 			w.Header().Set("ETag", `"3858f62230ac3c915f300c664312c11f"`)

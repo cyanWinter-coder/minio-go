@@ -437,16 +437,18 @@ func (c *Client) putObjectMultipartStreamNoLength(ctx context.Context, bucketNam
 	}
 
 	// Initiate a new multipart upload.
-	uploadID, err := c.newUploadID(ctx, bucketName, objectName, opts)
+	upload, err := c.newMultipartUpload(ctx, bucketName, objectName, opts)
 	if err != nil {
 		return UploadInfo{}, err
 	}
 
 	defer func() {
 		if err != nil {
-			c.abortFailedUpload(ctx, bucketName, objectName, uploadID)
+			err = upload.abort(ctx, err)
 		}
 	}()
+
+	uploadID := upload.uploadID
 
 	// Part number always starts with '1'.
 	partNumber := 1
@@ -507,6 +509,7 @@ func (c *Client) putObjectMultipartStreamNoLength(ctx context.Context, bucketNam
 
 		// Save successfully uploaded part metadata.
 		partsInfo[partNumber] = objPart
+		upload.recordPart(partNumber)
 
 		// Save successfully uploaded size.
 		totalUploadedSize += int64(length)
@@ -560,7 +563,7 @@ func (c *Client) putObjectMultipartStreamNoLength(ctx context.Context, bucketNam
 	opts = completeUploadOpts(opts)
 	applyAutoChecksum(&opts, allParts)
 
-	uploadInfo, err := c.completeMultipartUpload(ctx, bucketName, objectName, uploadID, complMultipartUpload, opts)
+	uploadInfo, err := upload.complete(ctx, complMultipartUpload, opts)
 	if err != nil {
 		return UploadInfo{}, err
 	}

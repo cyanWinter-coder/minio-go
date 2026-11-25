@@ -19,13 +19,14 @@ package minio
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 )
 
-func TestAbortFailedUploadIgnoresCanceledContext(t *testing.T) {
+func TestMultipartUploadAbortIgnoresCanceledContext(t *testing.T) {
 	var aborts atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete && r.URL.Query().Get("uploadId") == "upload-1" {
@@ -40,9 +41,33 @@ func TestAbortFailedUploadIgnoresCanceledContext(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	upload := &multipartUpload{
+		client:    clnt,
+		bucket:    "bucket",
+		object:    "object",
+		uploadID:  "upload-1",
+		partsSeen: make(map[int]struct{}),
+	}
+	// The caller's context is already canceled, but the abort detaches from
+	// it and must still reach the server.
+	callerCtx, cancel := context.WithCancel(context.Background())
 	cancel()
-	clnt.abortFailedUpload(ctx, "bucket", "object", "upload-1")
+	cause := errors.New("part upload failed")
+	abortErr := upload.abort(callerCtx, cause)
+	if abortErr == nil {
+		t.Fatal("abort returned nil, want the annotated cause")
+	}
+	if !errors.Is(abortErr, cause) {
+		t.Fatalf("abort error = %v, want it to wrap %v", abortErr, cause)
+	}
+	if info, ok := AsMultipartUploadError(abortErr); !ok || info.UploadID() != "upload-1" || info.AbortFailed() {
+		t.Fatalf("abort error carries wrong upload info: %v", abortErr)
+	}
+	// An already-finished upload is a no-op: no second abort request and a
+	// nil error.
+	if err := upload.abort(callerCtx, cause); err != nil {
+		t.Fatalf("second abort returned error: %v", err)
+	}
 
 	if n := aborts.Load(); n != 1 {
 		t.Fatalf("expected 1 abort request, got %d", n)

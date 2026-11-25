@@ -77,12 +77,11 @@ type ErrorResponse struct {
 //	}
 //	...
 func ToErrorResponse(err error) ErrorResponse {
-	switch err := err.(type) {
-	case ErrorResponse:
-		return err
-	default:
-		return ErrorResponse{}
+	var errResp ErrorResponse
+	if errors.As(err, &errResp) {
+		return errResp
 	}
+	return ErrorResponse{}
 }
 
 // Error - Returns S3 error string.

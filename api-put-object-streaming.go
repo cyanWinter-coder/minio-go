@@ -111,12 +111,10 @@ func (c *Client) putObjectMultipartStreamFromReadAt(ctx context.Context, bucketN
 	}
 
 	// Initiate a new multipart upload.
-	uploadID, err := c.newUploadID(ctx, bucketName, objectName, opts)
+	upload, err := c.newMultipartUpload(ctx, bucketName, objectName, opts)
 	if err != nil {
 		return UploadInfo{}, err
 	}
-
-	withChecksum := c.trailingHeaderSupport
 
 	// Aborts the multipart upload in progress, if the
 	// function returns any error, since we do not resume
@@ -124,9 +122,13 @@ func (c *Client) putObjectMultipartStreamFromReadAt(ctx context.Context, bucketN
 	// to relinquish storage space.
 	defer func() {
 		if err != nil {
-			c.abortFailedUpload(ctx, bucketName, objectName, uploadID)
+			err = upload.abort(ctx, err)
 		}
 	}()
+
+	uploadID := upload.uploadID
+
+	withChecksum := c.trailingHeaderSupport
 
 	// Total data read and written to server. should be equal to 'size' at the end of the call.
 	var totalUploadedSize int64
@@ -137,12 +139,17 @@ func (c *Client) putObjectMultipartStreamFromReadAt(ctx context.Context, bucketN
 	// Declare a channel that sends the next part number to be uploaded.
 	uploadPartsCh := make(chan uploadPartReq)
 
-	// Declare a channel that sends back the response of a part upload.
-	uploadedPartsCh := make(chan uploadedPartRes)
+	// Declare a channel that sends back the response of a part upload. It is
+	// buffered for every part so a worker whose peers already failed is never
+	// blocked sending its result while shutting down.
+	uploadedPartsCh := make(chan uploadedPartRes, totalPartsCount)
 
 	// Used for readability, lastPartNumber is always totalPartsCount.
 	lastPartNumber := totalPartsCount
 
+	// A failure of any part, or a caller cancellation, cancels the whole
+	// batch: in-flight workers stop and no further part numbers are handed
+	// out.
 	partitionCtx, partitionCancel := context.WithCancel(ctx)
 	defer partitionCancel()
 	// Send each part number to the channel to be processed.
@@ -165,7 +172,7 @@ func (c *Client) putObjectMultipartStreamFromReadAt(ctx context.Context, bucketN
 				var uploadReq uploadPartReq
 				var ok bool
 				select {
-				case <-ctx.Done():
+				case <-partitionCtx.Done():
 					return
 				case uploadReq, ok = <-uploadPartsCh:
 					if !ok {
@@ -209,13 +216,24 @@ func (c *Client) putObjectMultipartStreamFromReadAt(ctx context.Context, bucketN
 					sha256Hex:    "",
 					trailer:      trailer,
 				}
-				objPart, err := c.uploadPart(ctx, p)
-				if err != nil {
+				objPart, perr := c.uploadPart(partitionCtx, p)
+				if perr != nil {
+					// Cancel every other worker in the batch, then report the
+					// failure. The buffered channel guarantees the send does
+					// not block on the gather loop selecting the cancellation.
+					partitionCancel()
 					select {
-					case <-ctx.Done():
-					case uploadedPartsCh <- uploadedPartRes{
-						Error: err,
-					}:
+					case <-partitionCtx.Done():
+						// A cancellation from the caller wins over an error
+						// the HTTP layer synthesized from it: the caller's
+						// ctx.Err() is the distinguishable cause downstream.
+						if ctx.Err() != nil {
+							return
+						}
+					default:
+					}
+					uploadedPartsCh <- uploadedPartRes{
+						Error: perr,
 					}
 
 					// Exit the goroutine.
@@ -227,7 +245,12 @@ func (c *Client) putObjectMultipartStreamFromReadAt(ctx context.Context, bucketN
 
 				// Send successful part info through the channel.
 				select {
-				case <-ctx.Done():
+				case <-partitionCtx.Done():
+					// The batch was canceled while this part was in flight;
+					// the part may still have reached the server, so record
+					// it before dropping out so its number stays traceable.
+					upload.recordPart(uploadReq.PartNum)
+					return
 				case uploadedPartsCh <- uploadedPartRes{
 					Size:    objPart.Size,
 					PartNum: uploadReq.PartNum,
@@ -244,12 +267,17 @@ func (c *Client) putObjectMultipartStreamFromReadAt(ctx context.Context, bucketN
 	for u := 1; u <= totalPartsCount; u++ {
 		select {
 		case <-ctx.Done():
+			// Stop dispatching and cancel the in-flight workers; the deferred
+			// abort reclaims whatever made it to the server.
+			partitionCancel()
 			return UploadInfo{}, ctx.Err()
 		case uploadRes := <-uploadedPartsCh:
 			if uploadRes.Error != nil {
+				partitionCancel()
 				return UploadInfo{}, uploadRes.Error
 			}
 			allParts = append(allParts, uploadRes.Part)
+			upload.recordPart(uploadRes.PartNum)
 			// Update the totalUploadedSize.
 			totalUploadedSize += uploadRes.Size
 			complMultipartUpload.Parts = append(complMultipartUpload.Parts, CompletePart{
@@ -282,7 +310,7 @@ func (c *Client) putObjectMultipartStreamFromReadAt(ctx context.Context, bucketN
 		applyAutoChecksum(&opts, allParts)
 	}
 
-	uploadInfo, err := c.completeMultipartUpload(ctx, bucketName, objectName, uploadID, complMultipartUpload, opts)
+	uploadInfo, err := upload.complete(ctx, complMultipartUpload, opts)
 	if err != nil {
 		return UploadInfo{}, err
 	}
@@ -308,7 +336,7 @@ func (c *Client) putObjectMultipartStreamOptionalChecksum(ctx context.Context, b
 		return UploadInfo{}, err
 	}
 	// Initiates a new multipart request
-	uploadID, err := c.newUploadID(ctx, bucketName, objectName, opts)
+	upload, err := c.newMultipartUpload(ctx, bucketName, objectName, opts)
 	if err != nil {
 		return UploadInfo{}, err
 	}
@@ -319,9 +347,11 @@ func (c *Client) putObjectMultipartStreamOptionalChecksum(ctx context.Context, b
 	// storage space.
 	defer func() {
 		if err != nil {
-			c.abortFailedUpload(ctx, bucketName, objectName, uploadID)
+			err = upload.abort(ctx, err)
 		}
 	}()
+
+	uploadID := upload.uploadID
 
 	// Create checksums
 	// CRC32C is ~50% faster on AMD64 @ 30GB/s
@@ -403,6 +433,7 @@ func (c *Client) putObjectMultipartStreamOptionalChecksum(ctx context.Context, b
 
 		// Save successfully uploaded part metadata.
 		partsInfo[partNumber] = objPart
+		upload.recordPart(partNumber)
 
 		// Save successfully uploaded size.
 		totalUploadedSize += partSize
@@ -448,7 +479,7 @@ func (c *Client) putObjectMultipartStreamOptionalChecksum(ctx context.Context, b
 
 	opts = completeUploadOpts(opts)
 	applyAutoChecksum(&opts, allParts)
-	uploadInfo, err := c.completeMultipartUpload(ctx, bucketName, objectName, uploadID, complMultipartUpload, opts)
+	uploadInfo, err := upload.complete(ctx, complMultipartUpload, opts)
 	if err != nil {
 		return UploadInfo{}, err
 	}
@@ -491,7 +522,7 @@ func (c *Client) putObjectMultipartStreamParallel(ctx context.Context, bucketNam
 	}
 
 	// Initiates a new multipart request
-	uploadID, err := c.newUploadID(ctx, bucketName, objectName, opts)
+	upload, err := c.newMultipartUpload(ctx, bucketName, objectName, opts)
 	if err != nil {
 		return UploadInfo{}, err
 	}
@@ -502,9 +533,11 @@ func (c *Client) putObjectMultipartStreamParallel(ctx context.Context, bucketNam
 	// storage space.
 	defer func() {
 		if err != nil {
-			c.abortFailedUpload(ctx, bucketName, objectName, uploadID)
+			err = upload.abort(ctx, err)
 		}
 	}()
+
+	uploadID := upload.uploadID
 
 	// Total data read and written to server. should be equal to 'size' at the end of the call.
 	var totalUploadedSize int64
@@ -530,6 +563,15 @@ func (c *Client) putObjectMultipartStreamParallel(ctx context.Context, bucketNam
 	var partNumber int
 	var lastErr error
 	for partNumber = 1; partNumber <= totalPartsCount; partNumber++ {
+		// A caller cancellation stops further parts from being read or
+		// dispatched; in-flight workers fail through the canceled context.
+		select {
+		case <-ctx.Done():
+			cancel()
+			wg.Wait()
+			return UploadInfo{}, ctx.Err()
+		default:
+		}
 		// Proceed to upload the part.
 		var buf []byte
 		select {
@@ -623,23 +665,40 @@ func (c *Client) putObjectMultipartStreamParallel(ctx context.Context, bucketNam
 			}
 			objPart, uerr := c.uploadPart(ctx, p)
 			if uerr != nil {
-				errCh <- uerr
+				// The buffered channel absorbs every worker's failure even
+				// after the main loop has already canceled the batch.
+				select {
+				case errCh <- uerr:
+				case <-ctx.Done():
+				}
 				return
 			}
 
-			// Save successfully uploaded part metadata.
+			// Save successfully uploaded part metadata. The part may have
+			// reached the server while the batch was being canceled; recording
+			// it keeps the number traceable for the cleanup error.
 			mu.Lock()
 			partsInfo[partNumber] = objPart
 			mu.Unlock()
+			upload.recordPart(partNumber)
 
 			// Send buffer back so it can be reused.
-			bufs <- buf
+			select {
+			case bufs <- buf:
+			case <-ctx.Done():
+			}
 		}(partNumber)
 
 		// Save successfully uploaded size.
 		totalUploadedSize += int64(length)
 	}
 	wg.Wait()
+
+	// A caller cancellation is the distinguishable cause even when a worker
+	// also surfaced an error synthesized from the canceled context.
+	if cerr := ctx.Err(); cerr != nil {
+		return UploadInfo{}, cerr
+	}
 
 	// Collect any error
 	select {
@@ -691,7 +750,7 @@ func (c *Client) putObjectMultipartStreamParallel(ctx context.Context, bucketNam
 	opts = completeUploadOpts(opts)
 	applyAutoChecksum(&opts, allParts)
 
-	uploadInfo, err := c.completeMultipartUpload(ctx, bucketName, objectName, uploadID, complMultipartUpload, opts)
+	uploadInfo, err := upload.complete(ctx, complMultipartUpload, opts)
 	if err != nil {
 		return UploadInfo{}, err
 	}
